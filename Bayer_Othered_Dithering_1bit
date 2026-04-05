@@ -1,0 +1,35 @@
+import cv2
+import numpy as np
+import os
+
+def bayer_dithering(image_path, output_path):
+    # 1. 加载灰度图
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    h, w = img.shape
+    
+    # 2. 定义 4x4 Bayer 矩阵 (经典索引矩阵)
+    bayer_matrix = np.array([
+        [ 0, 8, 2, 10],
+        [12, 4, 14, 6],
+        [ 3, 11, 1, 9],
+        [15, 7, 13, 5]
+    ]) * 16 # 将 0-15 映射到 0-240
+    
+    # 3. 平铺矩阵以覆盖全图
+    # 这种对比方式能体现出“机械感”
+    tiled_matrix = np.tile(bayer_matrix, (h // 4 + 1, w // 4 + 1))[:h, :w]
+    
+    # 4. 执行抖动比较
+    binary = np.where(img > tiled_matrix, 255, 0).astype(np.uint8)
+    
+    cv2.imwrite(output_path, binary)
+
+# 批量处理逻辑
+base_dir = "/root/autodl-tmp/SD-pixelization-2"
+input_folder = os.path.join(base_dir, "input")
+output_folder = os.path.join(base_dir, "1bit/Bayer_Baseline")
+os.makedirs(output_folder, exist_ok=True)
+
+for f in os.listdir(input_folder):
+    if f.lower().endswith(('.png', '.jpg')):
+        bayer_dithering(os.path.join(input_folder, f), os.path.join(output_folder, f))

@@ -1,0 +1,162 @@
+import torch
+import torch.nn.functional as F
+import os
+from typing import Optional, Union, Tuple
+from PIL import Image
+import cv2
+import numpy as np
+
+from diffusers import (
+    StableDiffusionControlNetImg2ImgPipeline,
+    ControlNetModel,
+    DDIMScheduler
+)
+from peft import PeftModel 
+
+class PixelArtGenerator:
+    def __init__(
+        self,
+        base_model_path: str = "models/sd15",
+        lora_dir: str = "models/lora/1bit/step_3000", 
+        device: str = "cuda",
+        dtype: torch.dtype = torch.float16
+    ):
+        self.device = device
+        self.dtype = dtype
+        
+        print(f"--- Step 1: Loading Pipeline (Auto-loading VAE from sd15/vae) ---")
+
+        # ===================== 双 ControlNet 加载（你的本地路径） =====================
+        controlnet_canny = ControlNetModel.from_pretrained(
+            "/root/autodl-tmp/SD-pixelization-2/models/controlnet_canny",
+            torch_dtype=dtype
+        )
+        controlnet_soft = ControlNetModel.from_pretrained(
+            "/root/autodl-tmp/SD-pixelization-2/models/controlnet_softedge",
+            torch_dtype=dtype
+        )
+
+        self.pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
+            base_model_path,
+            controlnet=[controlnet_canny, controlnet_soft],
+            torch_dtype=dtype,
+            safety_checker=None,
+            requires_safety_checker=False
+        ).to(device)
+        
+        print(f"--- Step 2: Loading LoRA Weights ---")
+        try:
+            self.pipe.unet = PeftModel.from_pretrained(
+                self.pipe.unet, 
+                lora_dir, 
+                adapter_name="pixel_lora"
+            ).to(device)
+            print("Successfully loaded LoRA.")
+        except Exception as e:
+            print(f"LoRA Load Error: {e}")
+
+        self.pipe.scheduler = DDIMScheduler.from_config(
+            self.pipe.scheduler.config,
+            rescale_betas_zero_snr=True,
+            timestep_spacing="trailing"
+        )
+
+    def grid_quantization_callback(self, pipe, step_index, timestep, callback_kwargs):
+        latents = callback_kwargs["latents"]
+        grid_size = 1
+        if grid_size > 1:
+            s = latents.shape
+            latents = F.avg_pool2d(latents, kernel_size=grid_size, stride=grid_size)
+            latents = F.interpolate(latents, size=(s[2], s[3]), mode='nearest')
+            callback_kwargs["latents"] = latents
+        return callback_kwargs
+
+    def post_process_1bit(self, image: Image.Image, pixel_size: int = 8) -> Image.Image:
+        gray = image.convert('L')
+        img_array = np.array(gray)
+        binary = ((img_array > 140) * 255).astype(np.uint8) 
+        binary_img = Image.fromarray(binary, mode='L').convert('RGB')
+        
+        w, h = binary_img.size
+        small = binary_img.resize((max(1, w // pixel_size), max(1, h // pixel_size)), Image.NEAREST)
+        return small.resize((w, h), Image.NEAREST)
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        image_path: str,
+        prompt: str = "pure 1bit pixel art, black and white, monochrome, binarized, extremely sharp edges, white background",
+        negative_prompt: str = (
+            "color, colored shadows, green edges, blue edges, purple edges, chromatic aberration, color fringing, "
+            "gradient, blurry, gray, dithered, lowres, soft, "
+            "noisy, salt-and-pepper noise, scattered dots, random pixels, "
+            "jpeg artifacts, halftone, grainy, speckled, distorted, broken lines, "
+            "watermark, text, signature, ugly, disfigured"
+        ),
+        strength: float = 0.8,
+        pixel_size: int = 8,
+        seed: int = 42
+    ) -> Tuple[Image.Image, Image.Image, Image.Image, Image.Image]:
+        
+        # 图像预处理
+        init_image = Image.open(image_path).convert("RGB")
+        w, h = (init_image.size[0] // 8) * 8, (init_image.size[1] // 8) * 8
+        init_image = init_image.resize((w, h))
+        
+        # ===================== 同时生成 Canny + SoftEdge =====================
+        gray = cv2.cvtColor(np.array(init_image), cv2.COLOR_RGB2GRAY)
+        
+        # Canny 边缘（结构强）
+        edges_canny = cv2.Canny(gray, 100, 200)
+        canny_image = Image.fromarray(cv2.cvtColor(edges_canny, cv2.COLOR_GRAY2RGB)).resize((w, h))
+        
+        # SoftEdge 边缘（干净、无杂色）
+        soft_gray = cv2.GaussianBlur(gray, (3, 3), 0.4)
+        edges_soft = cv2.Canny(soft_gray, 50, 150)
+        soft_image = Image.fromarray(cv2.cvtColor(edges_soft, cv2.COLOR_GRAY2RGB)).resize((w, h))
+
+        generator = torch.Generator(device=self.device).manual_seed(seed)
+        
+        print(f"Running Inference (Guidance Scale: 25.0)...")
+        raw_result = self.pipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            image=init_image,
+            control_image=[canny_image, soft_image],
+            # ===================== 双权重融合 =====================
+            controlnet_conditioning_scale=[0.5, 0.5],
+            strength=strength,
+            num_inference_steps=30,
+            guidance_scale=25.0, 
+            generator=generator,
+            callback_on_step_end=self.grid_quantization_callback,
+            callback_on_step_end_tensor_inputs=["latents"]
+        ).images[0]
+
+        processed_result = self.post_process_1bit(raw_result, pixel_size=pixel_size)
+        
+        return canny_image, soft_image, raw_result, processed_result
+
+def main():
+    base_dir = "/root/autodl-tmp/SD-pixelization-2"
+    
+    gen = PixelArtGenerator(
+        base_model_path=f"{base_dir}/models/sd15",
+        lora_dir=f"{base_dir}/models/lora/1bit/step_3001"
+    )
+    
+    canny, soft, raw, final = gen.generate(
+        image_path=f"{base_dir}/input/test1.png",
+        strength=0.8,
+        pixel_size=8
+    )
+    
+    canny.save(f"{base_dir}/output_canny.png")
+    soft.save(f"{base_dir}/output_soft.png")
+    raw.save(f"{base_dir}/output_raw.png")
+    final.save(f"{base_dir}/output_final.png")
+    
+    print(f"--- All results saved in {base_dir} ---")
+
+if __name__ == "__main__":
+    main()

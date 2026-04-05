@@ -1,0 +1,131 @@
+import torch
+import os
+import numpy as np
+import cv2
+from PIL import Image
+from generate_1bit import PixelArtGenerator 
+
+class FinalAblationGenerator(PixelArtGenerator):
+    def __init__(self, base_model_path, lora_dir, device="cuda", dtype=torch.float16):
+        # 1. 初始化主 Pipe (带 LoRA)
+        super().__init__(base_model_path, lora_dir, device, dtype)
+        
+        # 2. 创建完全一致的干净 Pipe (不带 LoRA)
+        print("--- Step 2 (Ablation Rigor): Creating a matched clean pipeline ---")
+        # 核心：使用与主 Pipe 完全相同的类（不论是 Img2Img 还是 Txt2Img）
+        PipelineClass = self.pipe.__class__
+        
+        self.clean_pipe = PipelineClass.from_pretrained(
+            base_model_path,
+            controlnet=self.pipe.controlnet,
+            vae=self.pipe.vae,
+            text_encoder=self.pipe.text_encoder,
+            tokenizer=self.pipe.tokenizer,
+            scheduler=self.pipe.scheduler,
+            torch_dtype=dtype,
+            safety_checker=None,
+            feature_extractor=None
+        ).to(device)
+        
+        print(f"Successfully created clean pipeline of type: {PipelineClass.__name__}")
+
+    @torch.inference_mode()
+    def generate_detailed_ablation(
+        self,
+        image_path: str,
+        use_lora: bool = True,
+        canny_scale: float = 0.5,
+        soft_scale: float = 0.5,
+        use_post: bool = True,
+        seed: int = 42
+    ) -> Image.Image:
+        # 1. 图像预处理
+        init_image = Image.open(image_path).convert("RGB")
+        w, h = (init_image.size[0] // 8) * 8, (init_image.size[1] // 8) * 8
+        init_image = init_image.resize((w, h))
+        
+        gray = cv2.cvtColor(np.array(init_image), cv2.COLOR_RGB2GRAY)
+        canny_img = Image.fromarray(cv2.cvtColor(cv2.Canny(gray, 100, 200), cv2.COLOR_GRAY2RGB)).resize((w, h))
+        
+        soft_gray = cv2.GaussianBlur(gray, (3, 3), 0.4)
+        soft_img = Image.fromarray(cv2.cvtColor(cv2.Canny(soft_gray, 50, 150), cv2.COLOR_GRAY2RGB)).resize((w, h))
+
+        # 2. 准备控制图和参数
+        control_images = [canny_img, soft_img]
+        ct_scales = [canny_scale, soft_scale]
+        active_pipe = self.pipe if use_lora else self.clean_pipe
+        generator = torch.Generator(device=self.device).manual_seed(seed)
+
+        # 3. 动态构建参数字典 (适配不同管道逻辑)
+        kwargs = {
+            "prompt": "pure 1bit pixel art, black and white, monochrome, binarized, extremely sharp edges, white background",
+            "negative_prompt": "color, gradient, blurry, gray, lowres, soft, noisy",
+            "controlnet_conditioning_scale": ct_scales,
+            "num_inference_steps": 30,
+            "guidance_scale": 25.0,
+            "generator": generator,
+        }
+
+        # 判断管道类型
+        is_img2img = "Img2Img" in active_pipe.__class__.__name__
+        
+        if is_img2img:
+            kwargs["image"] = init_image            # Img2Img 下 image 是底图
+            kwargs["control_image"] = control_images # 控制图放 control_image
+            kwargs["strength"] = 0.8
+        else:
+            kwargs["image"] = control_images        # Txt2Img 下 image 直接放控制图
+
+        # 只有开启 LoRA 时才使用网格量化回调
+        if use_lora:
+            kwargs["callback_on_step_end"] = self.grid_quantization_callback
+            kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
+
+        # 4. 执行生成
+        raw_result = active_pipe(**kwargs).images[0]
+
+        # 5. 后处理
+        return self.post_process_1bit(raw_result, pixel_size=8) if use_post else raw_result
+
+def run_batch_study():
+    base_dir = "/root/autodl-tmp/SD-pixelization-2"
+    input_folder = os.path.join(base_dir, "input")   
+    output_root = os.path.join(base_dir, "1bit/ablation_final_results") 
+    os.makedirs(output_root, exist_ok=True)
+
+    gen = FinalAblationGenerator(
+        base_model_path=f"{base_dir}/models/sd15",
+        lora_dir=f"{base_dir}/models/lora/1bit/step_3000"
+    )
+    
+    image_files = sorted([f for f in os.listdir(input_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+    
+    test_cases = [
+        {"name": "01_Full_Model",    "lora": True,  "canny": 0.5, "soft": 0.5, "post": True},
+        {"name": "02_No_LoRA_Raw",   "lora": False, "canny": 0.5, "soft": 0.5, "post": False}, 
+        {"name": "03_Only_Canny",    "lora": True,  "canny": 0.5, "soft": 0.0, "post": True},
+        {"name": "04_Only_SoftEdge", "lora": True,  "canny": 0.0, "soft": 0.5, "post": True},
+        {"name": "05_No_ControlNet", "lora": True,  "canny": 0.0, "soft": 0.0, "post": True},
+    ]
+
+    for img_file in image_files:
+        img_path = os.path.join(input_folder, img_file)
+        case_dir = os.path.join(output_root, os.path.splitext(img_file)[0])
+        os.makedirs(case_dir, exist_ok=True)
+        print(f"\n[Processing] -> {img_file}")
+        for tc in test_cases:
+            print(f"  Config: {tc['name']}")
+            try:
+                res = gen.generate_detailed_ablation(
+                    image_path=img_path,
+                    use_lora=tc['lora'],
+                    canny_scale=tc['canny'],
+                    soft_scale=tc['soft'],
+                    use_post=tc['post']
+                )
+                res.save(os.path.join(case_dir, f"{tc['name']}.png"))
+            except Exception as e:
+                print(f"  Error on {tc['name']}: {e}")
+
+if __name__ == "__main__":
+    run_batch_study()

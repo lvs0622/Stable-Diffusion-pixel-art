@@ -1,0 +1,181 @@
+import os
+import torch
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import numpy as np
+from PIL import Image
+from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
+
+from diffusers import UNet2DConditionModel, DDPMScheduler, AutoencoderKL
+from transformers import CLIPTextModel, CLIPTokenizer
+from peft import LoraConfig, get_peft_model
+
+# 假设你的库路径正确
+from utils.pixel_dataset import PixelDataset
+
+# -----------------------------
+# 0. 核心改进：结构自适应 1-bit Loss
+# -----------------------------
+def advanced_1bit_loss(pred_images, org_decoded_images):
+    """
+    pred_images: 当前预测图 [0, 1]
+    org_decoded_images: VAE 原生解码图（作为结构基准）[0, 1]
+    """
+    # 1. 极化惩罚 (Quantization): 强制趋向 0 或 1
+    polar_loss = torch.mean(1.0 - torch.abs(2 * pred_images - 1))
+    
+    # 2. 局部密度均衡 (Local Density Loss): 
+    # 不再盲目惩罚黑块，而是要求 pred_images 的局部亮度均值接近原图的局部亮度均值
+    # 这样可以强迫模型用“抖动点”来模拟原图的灰度，从而保留结构
+    pred_avg = F.avg_pool2d(pred_images, kernel_size=3, stride=1, padding=1)
+    org_avg = F.avg_pool2d(org_decoded_images, kernel_size=3, stride=1, padding=1)
+    density_loss = F.mse_loss(pred_avg, org_avg)
+    
+    # 3. 结构一致性 (Structural Consistency):
+    # 惩罚预测图与原图在梯度方向上的差异，确保轮廓不崩坏
+    def get_gradients(img):
+        grad_x = img[:, :, :, 1:] - img[:, :, :, :-1]
+        grad_y = img[:, :, 1:, :] - img[:, :, :-1, :]
+        return grad_x, grad_y
+
+    grad_x_p, grad_y_p = get_gradients(pred_images)
+    grad_x_o, grad_y_o = get_gradients(org_decoded_images)
+    struct_loss = F.mse_loss(grad_x_p, grad_x_o[:, :, :, :]) + F.mse_loss(grad_y_p, grad_y_o[:, :, :, :])
+    
+    # 4. 颜色一致性
+    color_std = torch.mean(torch.std(pred_images, dim=1))
+    
+    # 权重配比：
+    # 1.0 polar_loss 负责黑白化
+    # 10.0 density_loss 负责用像素点模拟结构（解决黑块太密的关键）
+    # 5.0 struct_loss 负责锁死轮廓
+    return 1.0 * polar_loss + 10.0 * density_loss + 5.0 * struct_loss + 0.1 * color_std
+
+# -----------------------------
+# 1. 配置参数
+# -----------------------------
+train_data_dir = "dataset/1bit/train"
+output_dir = "models/lora/1bit_v6_struct_fix"
+sd_path = "models/sd15"
+
+batch_size = 1 
+learning_rate = 1e-4 
+train_steps = 3000
+device = "cuda"
+
+os.makedirs(output_dir, exist_ok=True)
+os.makedirs(os.path.join(output_dir, "samples"), exist_ok=True)
+
+# -----------------------------
+# 2. 加载模型
+# -----------------------------
+tokenizer = CLIPTokenizer.from_pretrained(sd_path, subfolder="tokenizer")
+text_encoder = CLIPTextModel.from_pretrained(sd_path, subfolder="text_encoder").to(device)
+vae = AutoencoderKL.from_pretrained(sd_path, subfolder="vae").to(device)
+unet = UNet2DConditionModel.from_pretrained(sd_path, subfolder="unet").to(device)
+
+vae.requires_grad_(False)
+text_encoder.requires_grad_(False)
+
+# -----------------------------
+# 3. LoRA 设置 (重点涵盖卷积层)
+# -----------------------------
+lora_config = LoraConfig(
+    r=32, # 增大秩，提升对复杂像素结构的记录能力
+    lora_alpha=32,
+    target_modules=[
+        "attn1.to_q", "attn1.to_k", "attn1.to_v", "attn1.to_out.0",
+        "attn2.to_q", "attn2.to_k", "attn2.to_v", "attn2.to_out.0",
+        "conv_in", "conv_out", "conv_shortcut"
+    ],
+    lora_dropout=0.05, 
+    bias="none",
+)
+unet = get_peft_model(unet, lora_config)
+unet.enable_gradient_checkpointing()
+
+prompt = "1bit pixel art, dithered, pure black and white, monochrome, nes style, sharp edges"
+tokens = tokenizer(prompt, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids
+train_prompt_embeds = text_encoder(tokens.to(device))[0]
+
+# -----------------------------
+# 4. 数据准备
+# -----------------------------
+dataset = PixelDataset(train_data_dir)
+loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+noise_scheduler = DDPMScheduler.from_config(sd_path, subfolder="scheduler")
+optimizer = torch.optim.AdamW(unet.parameters(), lr=learning_rate)
+
+loss_history, pix_loss_history = [], []
+
+# -----------------------------
+# 5. 训练循环
+# -----------------------------
+progress_bar = tqdm(range(train_steps))
+global_step = 0
+
+for epoch in range(1000):
+    unet.train()
+    for batch in loader:
+        pixel_values = batch.to(device)
+        
+        with torch.no_grad():
+            latents = vae.encode(pixel_values).latent_dist.sample() * 0.18215
+
+        noise = torch.randn_like(latents)
+        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device=device).long()
+        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+        noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states=train_prompt_embeds.repeat(latents.shape[0], 1, 1)).sample
+
+        loss_mse = F.mse_loss(noise_pred, noise)
+        total_loss = loss_mse
+
+        # --- 图像空间引导 (STE 优化版) ---
+        current_pix_loss = torch.tensor(0.0).to(device)
+        if global_step % 2 == 0:
+            alphas_cumprod = noise_scheduler.alphas_cumprod.to(device)
+            alpha_prod_t = alphas_cumprod[timesteps].view(-1, 1, 1, 1)
+            beta_prod_t = 1 - alpha_prod_t
+            pred_x0_latents = (noisy_latents - beta_prod_t ** 0.5 * noise_pred) / alpha_prod_t ** 0.5
+            
+            # 解码
+            decoded_images = vae.decode(1 / 0.18215 * pred_x0_latents).sample
+            decoded_images = (decoded_images / 2 + 0.5).clamp(0, 1)
+
+            # 核心：使用 decoded_images 自身作为参考基准计算高级 Loss
+            loss_pixel = advanced_1bit_loss(decoded_images, (pixel_values / 2 + 0.5).clamp(0, 1))
+            
+            # STE 伪量化
+            hard_1bit = (decoded_images > 0.5).float()
+            ste_images = decoded_images + (hard_1bit - decoded_images).detach()
+            loss_quant = F.mse_loss(ste_images, decoded_images)
+            
+            current_pix_loss = 0.8 * loss_pixel + 0.2 * loss_quant
+            total_loss = total_loss + current_pix_loss
+
+        optimizer.zero_grad()
+        total_loss.backward()
+        optimizer.step()
+
+        loss_history.append(loss_mse.item())
+        pix_loss_history.append(current_pix_loss.item())
+        
+        global_step += 1
+        progress_bar.update(1)
+        progress_bar.set_description(f"MSE: {loss_mse.item():.4f} Pix: {pix_loss_history[-1]:.4f}")
+
+        if global_step % 500 == 0:
+            save_path = os.path.join(output_dir, f"step_{global_step}")
+            unet.save_pretrained(save_path)
+            
+            # 保存训练中的解码图，直观观察结构是否找回
+            if 'decoded_images' in locals():
+                img = (decoded_images[0].detach().cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                Image.fromarray(img).save(os.path.join(output_dir, "samples", f"step_{global_step}.png"))
+
+        if global_step >= train_steps: break
+    if global_step >= train_steps: break
+
+print("Training Finished!")

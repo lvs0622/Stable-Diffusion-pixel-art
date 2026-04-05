@@ -1,0 +1,31 @@
+import cv2
+import numpy as np
+import os
+from PIL import Image
+
+def traditional_pixel_block_baseline(image_path, output_path, pixel_size=8):
+    # 1. 加载并缩放
+    img = Image.open(image_path).convert("RGB")
+    w, h = img.size
+    
+    # 2. 核心：通过最近邻插值实现“像素块化”
+    # 先缩小到极小，再放大回原尺寸，就会产生实心的方块
+    small = img.resize((max(1, w // pixel_size), max(1, h // pixel_size)), Image.NEAREST)
+    pixelated = small.resize((w, h), Image.NEAREST)
+    
+    # 3. 转为灰度并进行 1-bit 二值化
+    gray = cv2.cvtColor(np.array(pixelated), cv2.COLOR_RGB2GRAY)
+    _, binary = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY)
+    
+    # 保存结果
+    Image.fromarray(binary).convert("RGB").save(output_path)
+
+# 批量处理
+base_dir = "/root/autodl-tmp/SD-pixelization-2"
+input_folder = os.path.join(base_dir, "input")
+output_folder = os.path.join(base_dir, "1bit/Block_Baseline")
+os.makedirs(output_folder, exist_ok=True)
+
+for f in os.listdir(input_folder):
+    if f.lower().endswith(('.png', '.jpg')):
+        traditional_pixel_block_baseline(os.path.join(input_folder, f), os.path.join(output_folder, f))
